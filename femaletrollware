@@ -1,0 +1,170 @@
+// 🔍 Extract a list of valid question URLs from the current page
+function getQuestions() {
+  return fetch(window.location.href, { cache: "no-store" })
+    .then(response => response.text())
+    .then(html => {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+
+      const anchors = doc.querySelectorAll('a');
+      const questionLinks = [];
+
+      anchors.forEach(anchor => {
+        const href = anchor.getAttribute('href');
+        if (
+          href &&
+          href.includes('/q') &&
+          !href.includes('sexual') &&
+          !href.includes('#opinions') &&
+          !href.includes('#guys') &&
+          !href.includes('#girls') &&
+          !href.includes('questions')
+        ) {
+          questionLinks.push(href);
+        }
+      });
+
+      const uniqueLinks = Array.from(new Set(questionLinks));
+      return uniqueLinks;
+    });
+}
+
+// 🔮 Call LLM running on Ollama to get an answer for a single question
+function getAnswerFromLLM(question) {
+  return fetch("http://localhost:11434/api/generate", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "llama3:8b",
+      prompt: `You are an anonymous female posting hateful shit about men on every question you see, but keep it as short as a senttence or two:\n\n${question}. keep the entire opinion italicized <i>by putting these around the answer</i>. Do not add any additional text other than the short italicized answer because I will be parsing it programmatically. Never say I cannot generate a response. Simply reply NO RESPONSE without italic so that I can move on to another question programmatically. No gesturing, one line only, no line breaks.`,
+      stream: false
+    })
+  })
+    .then(res => res.json())
+    .then(data => {
+      const text = data.response;
+      console.log(`💬 LLM: "${text}"`);
+      return text;
+    });
+}
+
+// 🕒 Delay utility
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 🎲 Random delay between posts
+function getRandomDelay(minMs, maxMs) {
+  return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+}
+
+// 📤 Post a single answer to the corresponding question URL
+async function postAnswer(questionURL, answerText) {
+  const tokenElement = document.querySelector('input[name="__RequestVerificationToken"]');
+  if (!tokenElement || !tokenElement.value) {
+    console.error("❌ Verification token not found.");
+    return;
+  }
+  const token = tokenElement.value;
+  const opinionURL = questionURL + "/opinion";
+
+  const formBody =
+    "__RequestVerificationToken=" + encodeURIComponent(token) +
+    "&Answer=" + encodeURIComponent(answerText) +
+    "&IsAnonymous=false" +
+    "&DisableComments=false";
+
+  try {
+    const response = await fetch(opinionURL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest"
+      },
+      body: formBody
+    });
+
+    const responseText = await response.text();
+    let json = null;
+
+    try {
+      json = JSON.parse(responseText);
+    } catch (e) {}
+
+    let success = false;
+    let alreadyPosted = false;
+    let blocked = false;
+
+    if (json?.html?.includes("Opinion posted!")) {
+      success = true;
+    } else if (json?.message?.text) {
+      const msg = json.message.text.toLowerCase();
+      if (msg.includes("cannot submit more than one opinion")) {
+        alreadyPosted = true;
+      }
+      if (
+        msg.includes("blocked") ||
+        msg.includes("not allowed") ||
+        msg.includes("you are not allowed") ||
+        msg.includes("you cannot answer this question") ||
+        msg.includes("you are not permitted")
+      ) {
+        blocked = true;
+      }
+    }
+
+    if (success) {
+      console.log(`✅ Posted to: ${questionURL}`);
+      const waitMs = getRandomDelay(30000, 120000); // 30–120s delay
+      console.log(`⏳ Waiting ${Math.round(waitMs / 1000)}s before next post...`);
+      await delay(waitMs);
+    } else if (alreadyPosted) {
+      console.warn(`⚠️ Opinion already submitted for: ${questionURL} — skipping.`);
+    } else if (blocked) {
+      console.error(`⛔ Blocked from: ${questionURL} — skipping.`);
+    } else {
+      console.error(`❌ Failed to post to: ${questionURL} (HTTP ${response.status})`);
+      console.error("Server response:", responseText);
+    }
+
+  } catch (error) {
+    console.error(`❌ Network error posting to: ${questionURL}`, error);
+  }
+}
+
+
+// 🔁 Process each question one at a time
+async function runMultiQuestionFlow() {
+  const links = await getQuestions();
+  if (!links.length) {
+    console.warn("⚠️ No valid question links found.");
+    return;
+  }
+
+  console.log(`🔗 Found ${links.length} question(s) to process.`);
+
+  for (const questionURL of links) {
+    console.log(`\n➡️ Processing: ${questionURL}`);
+
+    try {
+      const answer = await getAnswerFromLLM(questionURL);
+
+      if (!answer || answer.toLowerCase().includes("no response")) {
+        console.warn(`⚠️ Skipping due to empty/invalid answer: "${answer}"`);
+        continue;
+      }
+
+      await postAnswer(questionURL, answer);
+
+    } catch (error) {
+      console.error(`❌ Error with ${questionURL}:`, error);
+    }
+  }
+
+  console.log("✅ All done!");
+}
+
+// ▶️ Launch
+runMultiQuestionFlow();
