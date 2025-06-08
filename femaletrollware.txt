@@ -73,7 +73,7 @@ async function postAnswer(questionURL, answerText) {
   const formBody =
     "__RequestVerificationToken=" + encodeURIComponent(token) +
     "&Answer=" + encodeURIComponent(answerText) +
-    "&IsAnonymous=false" +
+    "&IsAnonymous=true" +
     "&DisableComments=false";
 
   try {
