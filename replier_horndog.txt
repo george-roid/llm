@@ -5,7 +5,7 @@
 // @description  (PERSONAL NOTE: CTRL+F)
 // @description  --- "450" FOR OUTPUT LIMIT FILTER ---
 // @description  --- "COOM" FOR AI MODEL ---
-// @description  --- "clown" FOR AI INPUT ---
+// @description  --- "HORNDOG" FOR AI INPUT ---
 // @description  --- "GENERAL" FOR AI SYSTEM MESSAGE ---
 // @description  --- "HARMFUL" FOR WORD FILTERS ---
 // @description  --- "MAX_REPLIES" FOR BOTH USER REPLY LIMIT AND FOR ANON REPLY LIMIT ---
