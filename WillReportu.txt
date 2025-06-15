@@ -1,0 +1,1280 @@
+// ==UserScript==
+// @name         GAG Auto-Reply to Opinions (Offline LLM - Specialized)
+// @namespace    http://tampermonkey.net/
+// @version      2.36 // FIX: Hide "Trigger Now" button. Prevent page reload on resume.
+
+
+
+// @description  (PERSONAL NOTE: CTRL+F)
+// @description  --- "450" FOR OUTPUT LIMIT FILTER ---
+// @description  --- "er" FOR AI MODEL ---
+// @description  --- "HORNDOG" FOR AI INPUT ---
+// @description  --- "GENERAL" FOR AI SYSTEM MESSAGE ---
+// @description  --- "HARMFUL" FOR WORD FILTERS ---
+// @description  --- "MAX_REPLIES" FOR BOTH USER REPLY LIMIT AND FOR ANON REPLY LIMIT ---
+// @description  --- "39000" FOR TIME UNTIL NEXT OPINION ---
+// @description  --- "4000" FOR TIME BETWEEN BURST REPLIES ---
+// @description  --- "2, 5" FOR NUMBER OF BURST REPLIES ---
+// @description  --- "JANITORS" FOR WHITELIST ---
+
+
+
+// @description  Automates replies to existing opinions using an offline LLM, with gender/age detection, 4-450 char reply limit, extensive logging, block detection, rate limiting, and 3-try crazy mode if 3 normal replies fail.
+// @match        https://www.girlsaskguys.com/live-feed?tid=118*
+// @grant        none
+// ==/UserScript==
+
+(async function() {
+    // --- Configuration ---
+    // !! IMPORTANT: Ensure your local LLM (e.g., Ollama) is running and accessible at this address. !!
+    // Replace 'er' with the actual model name you are using with Ollama if different.
+    const OFFLINE_LLM_API_URL = "http://localhost:11434/api/generate";
+    const OFFLINE_LLM_MODEL = "er"; // Change this if your Ollama model name is different
+
+    const MAX_REPLIES_PER_USER_PER_HOUR = 2; // Max replies to a single opinion owner per hour.
+
+    // --- Whitelist for Only-Reply Mode (comma separated, case-insensitive) ---
+    const USER_WHITELIST = ["sueshe", "nikki1989", "_maya_"]; // <-- Edit this list as needed
+
+    // --- Persistent Toggles ---
+    let onlyReplyToWhitelist = localStorage.getItem('gag_only_reply_whitelist') === 'true';
+    let stopAtFirstProcessed = localStorage.getItem('gag_stop_at_first_processed') === 'true';
+
+    // --- Global State ---
+    let scriptRunning = true;
+    // Load multi-reply state from localStorage, defaulting to false
+    let multiReplyEnabled = localStorage.getItem('gag_multi_reply_state') === 'true';
+    let wipeTimeoutIds = {}; // To store timeout IDs for cancelling for each button
+
+    // --- Helper to Update Button Counts ---
+    function updateButtonCounts() {
+        const logButtonMap = {
+            "reply_log": { displayName: "Reply Logs", downloadBtnId: "download-reply_log-btn", wipeBtnId: "wipe-reply_log-btn" },
+            "rejected_opinions_log": { displayName: "Rejected Log", downloadBtnId: "download-rejected_opinions_log-btn", wipeBtnId: "wipe-rejected_opinions_log-btn" },
+            "blocked_users_log": { displayName: "Blocked Users Log", downloadBtnId: "download-blocked_users_log-btn", wipeBtnId: "wipe-blocked_users_log-btn" },
+            "skipped_log": { displayName: "Skipped Log", downloadBtnId: "download-skipped_log-btn", wipeBtnId: "wipe-skipped_log-btn" },
+            "error_log": { displayName: "Error Log", downloadBtnId: "download-error_log-btn", wipeBtnId: "wipe-error_log-btn" },
+        };
+        for (const logKey in logButtonMap) {
+            const map = logButtonMap[logKey];
+            let count = 0;
+            try {
+                count = JSON.parse(localStorage.getItem(logKey) || "[]").length;
+            } catch (e) {
+                console.error(`Error counting log ${logKey}:`, e);
+            }
+
+            const downloadBtn = document.getElementById(map.downloadBtnId);
+            if (downloadBtn) {
+                downloadBtn.textContent = `Download ${map.displayName} (${count})`;
+            }
+
+            const wipeBtn = document.getElementById(map.wipeBtnId);
+            if (wipeBtn) {
+                if (!wipeBtn.textContent.startsWith("Confirm")) {
+                    wipeBtn.textContent = `Wipe ${map.displayName} (${count})`;
+                }
+            }
+        }
+    }
+
+    // --- Logging Functions ---
+    function getLog(key) {
+        try {
+            return JSON.parse(localStorage.getItem(key)) || [];
+        } catch (e) {
+            console.error(`Error parsing log "${key}" from localStorage:`, e);
+            return [];
+        }
+    }
+
+    function setLog(key, log) {
+        try {
+            localStorage.setItem(key, JSON.stringify(log));
+            updateButtonCounts();
+        } catch (e) {
+            console.error(`Error saving log "${key}" to localStorage:`, e);
+        }
+    }
+
+    /**
+     * Generic logging function.
+     */
+    function logEntry(key, entry, identifierFn = (a, b) => false) {
+        const log = getLog(key);
+        if (!identifierFn || !log.some(e => identifierFn(e, entry))) {
+            log.push({ timestamp: new Date().toISOString(), ...entry });
+            setLog(key, log);
+            console.log(`📝 Logged to ${key}:`, entry);
+        } else {
+            console.log(`❕ Duplicate entry for ${key}, skipping:`, entry);
+        }
+    }
+
+    function logReply(url, title, opinion, reply, opinionOwnerUsername) {
+        logEntry("reply_log", { url, title, opinion, reply, opinionOwnerUsername });
+    }
+
+    function logRejectedOpinion(url, title, opinion, reason) {
+        logEntry("rejected_opinions_log", { url, title, opinion, reason }, (a, b) => a.url === b.url && a.opinion === b.opinion && a.reason === b.reason);
+    }
+
+    function logBlockedUser(username, type, reason) {
+        logEntry("blocked_users_log", { username, type, reason }, (a, b) => a.username === b.username && a.type === b.type);
+    }
+
+    function logSkippedOpinion(opinionId, reason) {
+        logEntry("skipped_log", { opinionId, reason }, (a, b) => a.opinionId === b.opinionId);
+    }
+
+    // This function now limits logging for the same error context to once per hour.
+    function logError(context, error, details = {}) {
+        const now = new Date();
+        const oneHourAgo = new Date(now.getTime() - (60 * 60 * 1000));
+        const errorLog = getLog("error_log");
+        const recentError = errorLog.find(entry =>
+            entry.context === context && new Date(entry.timestamp) > oneHourAgo
+        );
+        if (recentError) {
+            console.log(`❕ Skipping error log for context "${context}" as a similar error was logged within the last hour.`);
+            return;
+        }
+
+        logEntry("error_log", { context, error: error.message || error.toString(), stack: error.stack, ...details });
+    }
+
+
+    // --- Log Checking Functions ---
+
+    function isAlreadyReplied(questionUrl, opinionText) {
+        // Now only checks the log of replies made by this script
+        return getLog("reply_log").some(entry => entry.url === questionUrl && entry.opinion === opinionText);
+    }
+
+    function isOpinionSkipped(opinionId) {
+        if (!opinionId) return false;
+        return getLog("skipped_log").some(entry => entry.opinionId === opinionId);
+    }
+
+    function isRejectedLogged(url, opinion) {
+        return getLog("rejected_opinions_log").some(entry => entry.url === url && entry.opinion === opinion);
+    }
+
+    function isUserBlocked(username) {
+        if (!username || username.toLowerCase() === 'anonymous') return false;
+        return getLog("blocked_users_log").some(entry => entry.username === username);
+    }
+
+    // --- Rate Limiting Per User ---
+
+    function getReplyCountForUserInWindow(username) {
+        const now = new Date();
+        let windowMs;
+        if (!username || username.toLowerCase() === 'anonymous') {
+            windowMs = 6 * 60 * 1000; // 6 minutes
+        } else {
+            windowMs = 60 * 60 * 1000; // 1 hour
+        }
+        const windowAgo = new Date(now.getTime() - windowMs);
+        const replies = getLog("reply_log").filter(entry =>
+            entry.opinionOwnerUsername === username &&
+            new Date(entry.timestamp) > windowAgo
+        );
+        return replies.length;
+    }
+
+    function canReplyToUser(username) {
+        if (!username || username.toLowerCase() === 'anonymous') {
+            return getReplyCountForUserInWindow(username) < 30;
+        }
+        return getReplyCountForUserInWindow(username) < MAX_REPLIES_PER_USER_PER_HOUR;
+    }
+
+
+    // --- UI (Buttons for Download & Wipe, Control Panel) ---
+
+    // Helper to create buttons
+    function createButton(id, text, top, left, bgColor, hoverColor, zIndex = 9999) {
+        const btn = document.createElement('button');
+        btn.id = id;
+        btn.textContent = text;
+        btn.style.position = 'fixed';
+        btn.style.top = `${top}px`;
+        btn.style.left = `${left}px`;
+        btn.style.right = 'auto';
+        btn.style.bottom = 'auto';
+        btn.style.zIndex = zIndex;
+        btn.style.padding = '8px 12px';
+        btn.style.backgroundColor = bgColor;
+        btn.style.color = 'white';
+        btn.style.border = 'none';
+        btn.style.borderRadius = '5px';
+        btn.style.cursor = 'pointer';
+        btn.style.boxShadow = '0 2px 5px rgba(0,0,0,0.2)';
+        btn.onmouseover = () => btn.style.backgroundColor = hoverColor;
+        btn.onmouseout = () => btn.style.backgroundColor = bgColor;
+        document.body.appendChild(btn);
+        return btn;
+    }
+
+    function addDownloadAndWipeButtons() {
+        if (document.getElementById('download-reply_log-btn')) {
+            console.log("Download/Wipe buttons already present, skipping re-addition.");
+            return;
+        }
+
+        const btnOffset = 44;
+        let currentTop = 16;
+        const leftCol = 16;
+        const rightCol = 160; // Adjusted for two columns of buttons
+
+        const logButtonMap = {
+            "reply_log": {
+                displayName: "Reply Logs", downloadBtnId: "download-reply_log-btn", wipeBtnId: "wipe-reply_log-btn",
+                downloadColor: '#4CAF50', wipeColor: '#f44336', downloadHover: '#45a049', wipeHover: '#da190b',
+                columns: "<tr><th>#</th><th>Timestamp</th><th>Question</th><th>Opinion</th><th>Your Reply</th><th>Opinion Owner</th></tr>",
+                rowMapper: (entry, i) => `<tr><td>${i + 1}</td><td class="timestamp">${new Date(entry.timestamp).toLocaleString()}</td><td class="title"><a href="${entry.url}" target="_blank" rel="noopener">${entry.title}</a></td><td class="opinion">${entry.opinion}</td><td class="reply">${entry.reply}</td><td>${entry.opinionOwnerUsername || 'N/A'}</td></tr>`
+            },
+            "rejected_opinions_log": {
+                displayName: "Rejected Log", downloadBtnId: "download-rejected_opinions_log-btn", wipeBtnId: "wipe-rejected_opinions_log-btn",
+                downloadColor: '#9C27B0', wipeColor: '#f44336', downloadHover: '#7B1FA2', wipeHover: '#da190b',
+                columns: "<tr><th>#</th><th>Timestamp</th><th>Question</th><th>Opinion</th><th>Reason</th></tr>",
+                rowMapper: (entry, i) => `<tr><td>${i + 1}</td><td class="timestamp">${new Date(entry.timestamp).toLocaleString()}</td><td class="title"><a href="${entry.url}" target="_blank" rel="noopener">${entry.title}</a></td><td class="opinion">${entry.opinion}</td><td class="reason">${entry.reason}</td></tr>`
+            },
+            "blocked_users_log": {
+                displayName: "Blocked Users Log", downloadBtnId: "download-blocked_users_log-btn", wipeBtnId: "wipe-blocked_users_log-btn",
+                downloadColor: '#607D8B', wipeColor: '#f44336', downloadHover: '#455A64', wipeHover: '#da190b',
+                columns: "<tr><th>#</th><th>Timestamp</th><th>Username</th><th>Type</th><th>Reason</th></tr>",
+                rowMapper: (entry, i) => `<tr><td>${i + 1}</td><td class="timestamp">${new Date(entry.timestamp).toLocaleString()}</td><td>${entry.username}</td><td>${entry.type}</td><td>${entry.reason}</td></tr>`
+            },
+            "skipped_log": {
+                displayName: "Skipped Log", downloadBtnId: "download-skipped_log-btn", wipeBtnId: "wipe-skipped_log-btn",
+                downloadColor: '#FF5722', wipeColor: '#f44336', downloadHover: '#E64A19', wipeHover: '#da190b',
+                columns: "<tr><th>#</th><th>Timestamp</th><th>Opinion ID</th><th>Reason</th></tr>",
+                rowMapper: (entry, i) => `<tr><td>${i + 1}</td><td class="timestamp">${new Date(entry.timestamp).toLocaleString()}</td><td>${entry.opinionId}</td><td class="reason">${entry.reason}</td></tr>`
+            },
+            "error_log": {
+                displayName: "Error Log", downloadBtnId: "download-error_log-btn", wipeBtnId: "wipe-error_log-btn",
+                downloadColor: '#795548', wipeColor: '#f44336', downloadHover: '#5D4037', wipeHover: '#da190b',
+                columns: "<tr><th>#</th><th>Timestamp</th><th>Context</th><th>Error</th><th>Stack</th><th>Details</th></tr>",
+                rowMapper: (entry, i) => `<tr><td>${i + 1}</td><td class="timestamp">${new Date(entry.timestamp).toLocaleString()}</td><td class="context">${entry.context}</td><td class="error">${entry.error}</td><td class="stack">${entry.stack || 'N/A'}</td><td class="details">${JSON.stringify(entry.details)}</td></tr>`
+            },
+        };
+        // Create and attach download buttons
+        for (const logKey in logButtonMap) {
+            const map = logButtonMap[logKey];
+            map.downloadBtn = createButton(map.downloadBtnId, `Download ${map.displayName}`, currentTop, leftCol, map.downloadColor, map.downloadHover);
+            currentTop += btnOffset;
+        }
+
+        // Add a bit more space before wipe buttons
+        currentTop = 16; // Reset top for the second column
+        for (const logKey in logButtonMap) {
+            const map = logButtonMap[logKey];
+            map.wipeBtn = createButton(map.wipeBtnId, `Wipe ${map.displayName}`, currentTop, rightCol, map.wipeColor, map.wipeHover);
+            currentTop += btnOffset;
+        }
+
+        // Add Global Wipe Button
+        const globalWipeBtn = createButton("global-wipe-btn", "Wipe All Logs & Blocked Users", currentTop, leftCol, '#3F51B5', '#303F9F');
+        setupWipeConfirmation(globalWipeBtn, "all_logs_and_blocked", "All Logs & Blocked Users", true);
+
+
+        // Helper to generate HTML for download
+        function generateHtmlLog(logKey, logData, displayName, columns, rowMapper) {
+            let html = `<html><head><meta charset="utf-8"><title>${displayName}</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                h2 { color: #333; }
+                table { border-collapse: collapse; width: 100%; margin-top: 20px; }
+                th, td { border: 1px solid #ddd; padding: 10px; text-align: left; vertical-align: top; }
+                th { background-color: #f2f2f2; }
+                td.opinion, td.reply, td.reason, td.context, td.error, td.stack, td.details, td.prompt, td.status { color: #555; font-size: 0.95em; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
+                td.title { font-weight: bold; }
+                a { color: #007bff; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+                .timestamp { font-size: 0.8em; color: #888; }
+            </style>
+            </head><body>
+            <h2>GirlsAskGuys ${displayName}</h2>
+            <table>
+                ${columns}`;
+            logData.forEach((entry, i) => {
+                html += rowMapper(entry, i);
+            });
+            html += `</table></body></html>`;
+            return html;
+        }
+
+        // Set up click handlers for download buttons
+        for (const logKey in logButtonMap) {
+            const map = logButtonMap[logKey];
+            map.downloadBtn.onclick = function() {
+                let logData = getLog(logKey);
+                const htmlContent = generateHtmlLog(logKey, logData, map.displayName, map.columns, map.rowMapper);
+                const blob = new Blob([htmlContent], { type: "text/html" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `gag_${logKey}_${new Date().toISOString().slice(0,10)}.html`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                console.log(`📥 Downloaded ${map.displayName}.`);
+            };
+        }
+
+        // Set up click handlers for wipe buttons
+        function setupWipeConfirmation(button, storageKey, displayName, isGlobal = false) {
+            const originalText = `Wipe ${displayName}`;
+            const confirmText = `Confirm Wipe ${displayName}?`;
+
+
+            button.onclick = function() {
+                if (button.textContent === confirmText) {
+                    // Second click: Confirm deletion
+                    if (isGlobal) {
+                        for (const key in logButtonMap) {
+                            localStorage.removeItem(key);
+                        }
+                        localStorage.removeItem("blocked_users_log"); // Explicitly wipe this too
+                        console.log(`🗑️ All logs and blocked users wiped.`);
+                    } else {
+                        localStorage.removeItem(storageKey);
+                        console.log(`🗑️ Log for key "${storageKey}" wiped.`);
+                    }
+                    button.textContent = 'Wiped!';
+                    button.disabled = true;
+                    clearTimeout(wipeTimeoutIds[storageKey]);
+                    updateButtonCounts();
+                    setTimeout(() => {
+                        button.textContent = originalText;
+                        button.disabled = false;
+                        updateButtonCounts();
+                    }, 2000);
+                } else {
+                    // First click: Request confirmation
+                    button.textContent = confirmText;
+                    clearTimeout(wipeTimeoutIds[storageKey]);
+                    wipeTimeoutIds[storageKey] = setTimeout(() => {
+                        button.textContent = originalText;
+                        updateButtonCounts();
+                    }, 5000);
+                }
+            };
+        }
+
+        // Initialize confirmation for all wipe buttons
+        for (const logKey in logButtonMap) {
+            const map = logButtonMap[logKey];
+            setupWipeConfirmation(map.wipeBtn, logKey, map.displayName);
+        }
+
+        updateButtonCounts();
+    }
+
+    function createControlPanel() {
+        const panel = document.createElement('div');
+        panel.id = 'gag-control-panel';
+        panel.style.position = 'fixed';
+        panel.style.bottom = '16px';
+        panel.style.right = '16px';
+        panel.style.backgroundColor = '#333';
+        panel.style.color = 'white';
+        panel.style.padding = '10px 15px';
+        panel.style.borderRadius = '8px';
+        panel.style.boxShadow = '0 4px 10px rgba(0,0,0,0.3)';
+        panel.style.zIndex = 10000;
+        panel.style.display = 'flex';
+        panel.style.flexDirection = 'column';
+        panel.style.gap = '8px';
+        panel.style.fontFamily = 'Arial, sans-serif';
+
+        const statusDiv = document.createElement('div');
+        statusDiv.id = 'gag-script-status';
+        statusDiv.textContent = `Status: ${scriptRunning ? 'Running' : 'Paused'}`;
+        statusDiv.style.fontWeight = 'bold';
+        panel.appendChild(statusDiv);
+
+        const toggleBtn = document.createElement('button');
+        toggleBtn.id = 'gag-toggle-btn';
+        toggleBtn.textContent = scriptRunning ? 'Pause Script' : 'Resume Script';
+        toggleBtn.style.cssText = `
+            padding: 8px 12px;
+            background-color: ${scriptRunning ? '#FFC107' : '#4CAF50'};
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        `;
+        toggleBtn.onmouseover = () => toggleBtn.style.backgroundColor = scriptRunning ? '#FFA000' : '#45a049';
+        toggleBtn.onmouseout = () => toggleBtn.style.backgroundColor = scriptRunning ? '#FFC107' : '#4CAF50';
+        toggleBtn.onclick = () => {
+            scriptRunning = !scriptRunning;
+            statusDiv.textContent = `Status: ${scriptRunning ? 'Running' : 'Paused'}`;
+            toggleBtn.textContent = scriptRunning ? 'Pause Script' : 'Resume Script';
+            toggleBtn.style.backgroundColor = scriptRunning ? '#FFC107' : '#4CAF50';
+            toggleBtn.onmouseover = () => toggleBtn.style.backgroundColor = scriptRunning ? '#FFA000' : '#45a049';
+            toggleBtn.onmouseout = () => toggleBtn.style.backgroundColor = scriptRunning ? '#FFC107' : '#4CAF50';
+
+            // --- MODIFICATION: No longer reloads the page on resume ---
+            if (scriptRunning) {
+                console.log("✅ Script resumed. The process will continue from where it left off.");
+            } else {
+                console.log("⏸️ Script paused. The current operation will finish, then it will wait.");
+            }
+        };
+        panel.appendChild(toggleBtn);
+        // --- Multi-Reply Toggle ---
+        const multiReplyToggleBtn = document.createElement('button');
+        multiReplyToggleBtn.id = 'gag-multi-reply-toggle-btn';
+        multiReplyToggleBtn.textContent = `Multi-Reply: ${multiReplyEnabled ? 'ON' : 'OFF'}`;
+        multiReplyToggleBtn.style.cssText = `
+            padding: 8px 12px;
+            background-color: ${multiReplyEnabled ? '#4CAF50' : '#f44336'};
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        `;
+        // onclick handler now saves the state to localStorage
+        multiReplyToggleBtn.onclick = () => {
+            multiReplyEnabled = !multiReplyEnabled;
+            // Save the new state to localStorage
+            localStorage.setItem('gag_multi_reply_state', multiReplyEnabled);
+            multiReplyToggleBtn.textContent = `Multi-Reply: ${multiReplyEnabled ? 'ON' : 'OFF'}`;
+            multiReplyToggleBtn.style.backgroundColor = multiReplyEnabled ? '#4CAF50' : '#f44336';
+            console.log(`Multi-reply mode is now ${multiReplyEnabled ? 'ENABLED' : 'DISABLED'}.`);
+        };
+        panel.appendChild(multiReplyToggleBtn);
+        // --- End Multi-Reply Toggle ---
+
+        // --- Only Reply to Whitelist Toggle ---
+        const whitelistBtn = document.createElement('button');
+        whitelistBtn.id = 'gag-whitelist-toggle-btn';
+        whitelistBtn.textContent = `Whitelist Only: ${onlyReplyToWhitelist ? 'ON' : 'OFF'}`;
+        whitelistBtn.style.cssText = `
+            padding: 8px 12px;
+            background-color: ${onlyReplyToWhitelist ? '#4CAF50' : '#f44336'};
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        `;
+        whitelistBtn.onclick = () => {
+            onlyReplyToWhitelist = !onlyReplyToWhitelist;
+            localStorage.setItem('gag_only_reply_whitelist', onlyReplyToWhitelist);
+            whitelistBtn.textContent = `Whitelist Only: ${onlyReplyToWhitelist ? 'ON' : 'OFF'}`;
+            whitelistBtn.style.backgroundColor = onlyReplyToWhitelist ? '#4CAF50' : '#f44336';
+            console.log(`Whitelist-only mode is now ${onlyReplyToWhitelist ? 'ENABLED' : 'DISABLED'}.`);
+        };
+        panel.appendChild(whitelistBtn);
+        // --- Stop At First Processed Toggle ---
+        const stopAtFirstBtn = document.createElement('button');
+        stopAtFirstBtn.id = 'gag-stop-at-first-toggle-btn';
+        stopAtFirstBtn.textContent = `Stop At First Processed: ${stopAtFirstProcessed ? 'ON' : 'OFF'}`;
+        stopAtFirstBtn.style.cssText = `
+            padding: 8px 12px;
+            background-color: ${stopAtFirstProcessed ? '#4CAF50' : '#f44336'};
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        `;
+        stopAtFirstBtn.onclick = () => {
+            stopAtFirstProcessed = !stopAtFirstProcessed;
+            localStorage.setItem('gag_stop_at_first_processed', stopAtFirstProcessed);
+            stopAtFirstBtn.textContent = `Stop At First Processed: ${stopAtFirstProcessed ? 'ON' : 'OFF'}`;
+            stopAtFirstBtn.style.backgroundColor = stopAtFirstProcessed ? '#4CAF50' : '#f44336';
+            console.log(`Stop-at-first-processed mode is now ${stopAtFirstProcessed ? 'ENABLED' : 'DISABLED'}.`);
+        };
+        panel.appendChild(stopAtFirstBtn);
+
+        // --- MODIFICATION: "Trigger Now" button is now hidden ---
+        /*
+        const triggerBtn = document.createElement('button');
+        triggerBtn.id = 'gag-trigger-btn';
+        triggerBtn.textContent = 'Trigger Now';
+        triggerBtn.style.cssText = `
+            padding: 8px 12px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        `;
+        triggerBtn.onmouseover = () => triggerBtn.style.backgroundColor = '#0056b3';
+        triggerBtn.onmouseout = () => triggerBtn.style.backgroundColor = '#007bff';
+        triggerBtn.onclick = () => {
+            console.log("Manual trigger initiated. Reloading page.");
+            window.location.reload(); // Reload to re-initiate the main loop
+        };
+        panel.appendChild(triggerBtn);
+        */
+
+        document.body.appendChild(panel);
+    }
+
+    function showBlockedAnimation() {
+        let blockDiv = document.getElementById('gag-blocked-notification');
+        if (!blockDiv) {
+            blockDiv = document.createElement('div');
+            blockDiv.id = 'gag-blocked-notification';
+            blockDiv.style.position = 'fixed';
+            blockDiv.style.top = '50%';
+            blockDiv.style.left = '50%';
+            blockDiv.style.transform = 'translate(-50%, -50%)';
+            blockDiv.style.backgroundColor = 'rgba(255, 0, 0, 0.8)';
+            blockDiv.style.color = 'white';
+            blockDiv.style.padding = '20px 40px';
+            blockDiv.style.borderRadius = '10px';
+            blockDiv.style.zIndex = 10001;
+            blockDiv.style.fontSize = '24px';
+            blockDiv.style.fontWeight = 'bold';
+            blockDiv.style.textAlign = 'center';
+            blockDiv.style.opacity = '0';
+            blockDiv.style.transition = 'opacity 0.5s ease-in-out';
+            blockDiv.textContent = "Blocked from replying!";
+            document.body.appendChild(blockDiv);
+        }
+
+        blockDiv.style.opacity = '1';
+        setTimeout(() => {
+            blockDiv.style.opacity = '0';
+        }, 1500); // Display for 1.5 seconds
+    }
+
+
+    // --- Username Slugify Helper ---
+    function slugifyUsername(username) {
+        return username ?
+            username.trim().replace(/\s+/g, "-") : "";
+    }
+    // --- Helpers ---
+    function delay(ms) { return new Promise(res => setTimeout(res, ms)); }
+    function getRandomDelay(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+    // --- Fetch with Cloudflare distinction ---
+    async function safeFetch(url, options = {}) {
+        while (true) {
+            try {
+                const res = await fetch(url, options);
+                const text = await res.text();
+                if (
+                    text.toLowerCase().includes("cloudflare") ||
+                    text.toLowerCase().includes("cf-chl-widget") ||
+                    text.toLowerCase().includes("attention required!") ||
+                    text.toLowerCase().includes("captcha") ||
+                    res.status === 403
+                ) {
+                    console.warn(`🛡️ Cloudflare block detected for ${url}. Waiting 10s before retry.`);
+                    logError("Cloudflare detected", new Error("Cloudflare block"), { url, status: res.status });
+                    await delay(10000);
+                    continue;
+                }
+                return text;
+            } catch (e) {
+                if (e && e.message && e.message.toLowerCase().includes("cloudflare")) {
+                    console.warn(`🛡️ Cloudflare error for ${url}. Waiting 10s before retry.`);
+                    logError("Cloudflare error", e, { url });
+                    await delay(5000);
+                    continue;
+                }
+                console.error("❌ Network error, retrying in 5 seconds...", e);
+                logError("Network error during fetch", e, { url });
+                await delay(5000);
+            }
+        }
+    }
+
+    /**
+     * Iterates over .feed-card sections, finds opinions within them,
+     * and correctly extracts the opinion ID from the parent section's `data-id` attribute.
+     * This version correctly parses the asker's username from the feed card itself.
+     */
+    async function getLiveFeedOpinionsToReply() {
+        const feedCards = Array.from(document.querySelectorAll('section.feed-card'));
+        const opinionsToProcess = [];
+        let processedCardCount = 0;
+        let foundProcessed = false;
+
+        console.log(`[getLiveFeedOpinionsToReply] Found ${feedCards.length} feed cards.`);
+        if (feedCards.length === 0) {
+            console.warn("No feed cards found with 'section.feed-card'. Selector might be outdated or content not loaded.");
+            logError("DOM Parsing", new Error("No feed cards found"), { selector: "section.feed-card" });
+            return [];
+        }
+
+        for (const feedCard of feedCards) {
+            if (foundProcessed) break;
+            processedCardCount++;
+
+            const questionLink = feedCard.querySelector('.post-title');
+            if (!questionLink || !questionLink.href) {
+                console.log(`[Card ${processedCardCount}] Skipping: No question link found.`);
+                continue;
+            }
+            const questionUrl = questionLink.href;
+            const questionTitle = questionLink.textContent.trim();
+
+            const rawId = feedCard.dataset.id || '';
+            let opinionId = '';
+            if (rawId.startsWith('o')) {
+                opinionId = rawId.substring(1);
+            } else {
+                continue; // This card is not an opinion card.
+            }
+
+            // A feed-card contains multiple `js-card-content` divs.
+            // One for the question, one for the opinion.
+            const contentBlocks = Array.from(feedCard.querySelectorAll('.js-card-content'));
+            let askerUsername = "anonymous";
+            let askerGender = "unknown";
+            let opinionCard = null;
+
+            for (const block of contentBlocks) {
+                // Find the action type span, which can be in a couple of places
+                const ownerActionSpan = block.querySelector('.owner-action .action-type, .owner-info > .action-type');
+                if (ownerActionSpan) {
+                    const actionText = ownerActionSpan.textContent.trim();
+                    if (actionText === 'Asked') {
+                        // This block is the question block, extract asker info
+                        const askerInfoDiv = block.querySelector('.owner-info');
+                        if (askerInfoDiv) {
+                            if (askerInfoDiv.classList.contains('guy')) {
+                                askerGender = "male";
+                            } else if (askerInfoDiv.classList.contains('girl')) {
+                                askerGender = "female";
+                            }
+                            const usernameElement = askerInfoDiv.querySelector('.user-name, .display-name');
+                            if (usernameElement && usernameElement.textContent.trim()) {
+                                askerUsername = usernameElement.textContent.trim();
+                            }
+                        }
+                    } else if (actionText === 'Shared opinion') {
+                        // This block is the opinion block
+                        opinionCard = block;
+                    }
+                }
+            }
+
+            if (!opinionCard) {
+                console.log(`[Card ${processedCardCount}] Skipping: No opinion card found within feed card ${opinionId}.`);
+                continue;
+            }
+
+            // --- FIX STARTS HERE ---
+            // Get the initial opinion text immediately after finding the card.
+            const opinionElement = opinionCard.querySelector('.answer-text');
+            if (!opinionElement) {
+                 logSkippedOpinion(opinionId, "Could not find opinion text element.");
+                 continue;
+            }
+            const initialOpinionText = opinionElement.textContent.trim();
+            // --- FIX ENDS HERE ---
+
+            if (
+                isOpinionSkipped(opinionId) ||
+                isAlreadyReplied(questionUrl, initialOpinionText) ||
+                isRejectedLogged(questionUrl, initialOpinionText)
+            ) {
+                if (stopAtFirstProcessed) {
+                    console.log(`[Card ${processedCardCount}] Skipping: Already processed and 'Stop At First' is ON.`);
+                    foundProcessed = true;
+                    break; // Stop scanning further
+                }
+                continue;
+            }
+
+            let opinionOwnerGender = "unknown";
+            let opinionOwnerUsername = "anonymous";
+            const ownerInfoDiv = opinionCard.querySelector('.owner-info');
+            if (ownerInfoDiv) {
+                if (ownerInfoDiv.classList.contains('guy')) {
+                    opinionOwnerGender = "male";
+                } else if (ownerInfoDiv.classList.contains('girl')) {
+                    opinionOwnerGender = "female";
+                }
+                const usernameElement = ownerInfoDiv.querySelector('.user-name, .display-name');
+                if (usernameElement && usernameElement.textContent.trim()) {
+                    opinionOwnerUsername = usernameElement.textContent.trim();
+                } else {
+                    const userLink = ownerInfoDiv.querySelector('a[href*="/member/"]');
+                    if (userLink && userLink.textContent.trim()) {
+                        opinionOwnerUsername = userLink.textContent.trim();
+                    }
+                }
+            }
+
+            if (isUserBlocked(askerUsername)) {
+                logSkippedOpinion(opinionId, `Asker blocked: ${askerUsername}`);
+                continue;
+            }
+            if (isUserBlocked(opinionOwnerUsername)) {
+                logSkippedOpinion(opinionId, `Opinion owner blocked: ${opinionOwnerUsername}`);
+                continue;
+            }
+
+            // --- Whitelist Filtering ---
+            if (onlyReplyToWhitelist) {
+                const lowerOwner = (opinionOwnerUsername || '').toLowerCase();
+                if (!USER_WHITELIST.map(u => u.toLowerCase()).includes(lowerOwner)) {
+                    // Not in whitelist, skip
+                    continue;
+                }
+            }
+
+            if (!canReplyToUser(opinionOwnerUsername)) {
+                logSkippedOpinion(opinionId, `Rate limit hit for user: ${opinionOwnerUsername}`);
+                continue;
+            }
+
+            if (initialOpinionText.length > 900) {
+                logSkippedOpinion(opinionId, `Opinion text too long on initial check (${initialOpinionText.length} chars)`);
+                continue;
+            }
+
+            const showMoreBtn = opinionElement.querySelector('.show-more');
+            if (showMoreBtn) {
+                showMoreBtn.click();
+                await delay(500);
+            }
+            let opinionText = opinionElement.textContent.trim();
+            if (!opinionText) {
+                logSkippedOpinion(opinionId, "Opinion text empty after expansion");
+                continue;
+            }
+
+            if (opinionText.length > 900) {
+                logSkippedOpinion(opinionId, `Opinion text too long after expansion (${opinionText.length} chars)`);
+                continue;
+            }
+
+            let replyBtn = opinionCard.querySelector('.user-actions-row .js-comment-trigger.js-comment-btn');
+            if (!replyBtn) {
+                logSkippedOpinion(opinionId, "No reply button found");
+                continue;
+            }
+
+            console.log(`[Card ${processedCardCount}] Found eligible opinion: ${opinionId}. Asker: ${askerUsername}`);
+            opinionsToProcess.push({
+                card: opinionCard,
+                opinionId: opinionId,
+                replyBtn: replyBtn,
+                questionUrl: questionUrl,
+                questionTitle: questionTitle,
+                opinionText: opinionText,
+                opinionOwnerGender: opinionOwnerGender,
+                opinionOwnerUsername: opinionOwnerUsername,
+                askerUsername: askerUsername,
+                askerGender: askerGender
+            });
+        }
+        return opinionsToProcess;
+    }
+
+    /**
+     * Checks if a server response indicates the user is blocked,
+     * based on a specific JSON error code and message.
+     * @param {string} responseText The raw text from the server response.
+     * @returns {boolean} True if the specific blocked message is found.
+     */
+    function isBlockedResponse(responseText) {
+        try {
+            const json = JSON.parse(responseText);
+            if (json.message &&
+                json.message.code === 186 &&
+                json.message.text === "Not allowed to post! You blocked the user or are blocked by the user!") {
+                return true;
+            }
+        } catch (e) {
+            // Not a valid JSON response, so it can't be the specific blocked message.
+            return false;
+        }
+        return false;
+    }
+
+
+    // --- Offline LLM logic (Ollama) ---
+    async function getAnswerFromLLM(fullPrompt, crazy = false) {
+        let prompt = `You are an aspiring moderator named Will Reportu, you call your fucking self a fucking responsible netizen. as an overexaggerated parody of social justice warrior and proclaimed dildo wielding woke feminist who gets stimulated sexually from censorship, respond to the opinion as Will Reportu, threatening to report, fucking uniquely, pornographically stress the fact that you are the soyboy cuckold with a micropenis who has a rainbow-colored buttplug that vibrates whenever you hit the "Report" button on violations of community guidelines or even simply what triggers you. compensate for your lack of masculinity now in 2025 by trying to police everyone else's words. But you only reply with one disgusting paragraph.`; //
+        if (crazy) prompt += " be really crazy:";
+        const payload = {
+            model: OFFLINE_LLM_MODEL,
+            prompt: `${prompt}\n${fullPrompt}`,
+            stream: false,
+            options: {
+                temperature: crazy ? 0.9 : 0.7,
+                num_predict: 480
+            }
+        };
+        try {
+            const response = await fetch(OFFLINE_LLM_API_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error("Offline LLM API Error:", response.status, errorText);
+                logError("LLM API Error", new Error(errorText), { status: response.status, prompt: fullPrompt });
+                return "";
+            }
+
+            const data = await response.json();
+            const text = data.response ? data.response : "";
+
+            console.log("LLM raw answer (Offline LLM):", text);
+            return text;
+        } catch (error) {
+            console.error("Error fetching from Offline LLM API:", error);
+            logError("LLM Fetch Error", error, { prompt: fullPrompt });
+            return "";
+        }
+    }
+
+    // Filtering logic (whole-word match, logs blocked word, character limits, and now asterisks)
+    function isWeirdResponse(answer) {
+        if (!answer) {
+            console.warn(`Filtered due to empty answer.`);
+            return true;
+        }
+        const lower = answer.trim().toLowerCase();
+        if (answer.includes('*')) {
+            console.warn(`Filtered due to asterisk (*) character.`);
+            return true;
+        }
+
+        const blocked = [
+            "tag", "tagging", "ai", "assistant", "help with that", "i am just a", "harmful content", "reply longer", "longer reply",
+            "explicit", "bot", "chatbot", "i'm an ai", "as an ai", "as a language model", "as an assistant",
+            "i cannot", "i'm unable", "i do not have", "i am unable", "uniquely", "pornographically", "cuckoldistic", "graphic", "parody",
+            "humorous", "pornographic", "assist", "i'm sorry", "here's a", "here is a", "overexaggerated", "a reply", "instructed", "artificial intelligence", "orgies", "satirical", "programmed", "orgy",
+            "i am a language model", "tagged"
+        ];
+        const words = lower.split(/\W+/).filter(word => word.length > 0);
+        for (const word of blocked) {
+            if (words.includes(word)) {
+                console.warn(`Filtered due to blocked word: "${word}"`);
+                return true;
+            }
+        }
+
+        if (lower.length < 4) {
+            console.warn(`Filtered due to short length (${lower.length}), less than 4 characters.`);
+            return true;
+        }
+        if (lower.length > 1500) {
+            console.warn(`Filtered due to long length (${lower.length}), exceeds 1500 characters.`);
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Attempts to "like" a question to detect if the asker has blocked the user.
+     * @param {string} questionUrl The URL of the question to like.
+     * @returns {Promise<boolean>} True if liking succeeded (not blocked by asker), false otherwise.
+     */
+    async function tryLikeQuestion(questionUrl) {
+        // Fetches the question page to get its content and find the like button and verification token.
+        const html = await safeFetch(questionUrl);
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, "text/html");
+        // Find the question's like button based on the provided HTML structure.
+        const likeSpan = doc.querySelector('span.js-post-like[data-href]');
+        if (!likeSpan) {
+            console.warn(`Could not find question like span on ${questionUrl}. Cannot test for asker block.`);
+            logError("DOM Parsing", new Error("Question like span not found"), { url: questionUrl });
+            return true; // Assume not blocked if we can't test.
+        }
+
+        // Get the URL to POST to from the data-href attribute.
+        const likePostUrl = likeSpan.dataset.href;
+        if (!likePostUrl) {
+            console.warn(`Like span 'data-href' URL not found for ${questionUrl}. Cannot test for asker block.`);
+            return true; // Assume not blocked.
+        }
+
+        // Get the verification token from an input field on the page.
+        const tokenInput = doc.querySelector('input[name="__RequestVerificationToken"]');
+        const token = tokenInput ? tokenInput.value : null;
+        if (!token) {
+            console.warn(`Verification token not found for liking ${questionUrl}. Cannot test for asker block.`);
+            return true; // Assume not blocked.
+        }
+
+        // Prepare the POST data.
+        const formData = new URLSearchParams();
+        formData.append("__RequestVerificationToken", token);
+        try {
+            // Make the POST request to "like" the question.
+            const response = await fetch(likePostUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": questionUrl,
+                    "Origin": window.location.origin
+                },
+                body: formData.toString(),
+                credentials: "same-origin"
+            });
+            const responseText = await response.text();
+
+            // Check if the response indicates the user is blocked by the specific error code.
+            if (isBlockedResponse(responseText)) {
+                console.log(`User blocked by asker for question ${questionUrl} (detected via like attempt).`);
+                return false; // Liking failed due to a block.
+            }
+
+            // Check for a successful response, either by status code or response content.
+            if (response.ok) {
+                 console.log(`Successfully liked question ${questionUrl}. Asker is likely not blocked.`);
+                 return true; // Liking succeeded.
+            }
+
+            // As a fallback, check for a JSON response indicating a vote was cast.
+            try {
+                const jsonResponse = JSON.parse(responseText);
+                if (jsonResponse?.data?.Voted) {
+                     console.log(`Successfully liked question ${questionUrl} (JSON check). Asker is not blocked.`);
+                     return true;
+                }
+            } catch(e) { /* Ignore if not JSON */ }
+
+            console.warn(`Unexpected response when trying to like ${questionUrl}:`, responseText.substring(0, 200));
+            return true; // Assume not blocked on unexpected responses.
+
+        } catch (error) {
+            console.error(`Error trying to like question ${questionUrl}:`, error);
+            logError("Like Question Error", error, { url: questionUrl });
+            return true; // Assume not blocked on network error.
+        }
+    }
+
+
+    /**
+     * Posts the reply to the opinion directly via HTTP POST (no UI interaction).
+     * @param {object} op - Opinion object with necessary fields.
+     * @returns {Promise<{status: string, message?: string, responseText?: string, by?: string}>}
+     */
+    async function postReply({questionUrl, title, opinionId, opinionText, replyText, opinionOwnerUsername, askerUsername}) {
+        let postUrl;
+        try {
+            // Remove any trailing slash from questionUrl
+            let baseUrl = questionUrl.replace(/\/$/, "");
+            postUrl = `${baseUrl}/comment-opinion?id=${opinionId}`;
+        } catch (e) {
+            logError("Building POST URL", e, { questionUrl, opinionId });
+            return { status: "failed", message: "Failed to build POST URL" };
+        }
+
+        // Try to get __RequestVerificationToken from DOM first, then cookies
+        let token = null;
+        let tokenInput = document.querySelector('input[name="__RequestVerificationToken"]');
+        if (tokenInput && tokenInput.value) {
+            token = tokenInput.value;
+        } else {
+            // Try from cookies
+            let match = document.cookie.match(/__RequestVerificationToken=([^;]+)/);
+            token = match ? decodeURIComponent(match[1]) : null;
+        }
+        if (!token) {
+            // As fallback, fetch question page and parse token
+            try {
+                const html = await safeFetch(questionUrl);
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(html, "text/html");
+                let tokenInput = doc.querySelector('input[name="__RequestVerificationToken"]');
+                token = tokenInput ? tokenInput.value : null;
+            } catch (e) {
+                logError("Token fetch fallback", e, { questionUrl });
+            }
+        }
+        if (!token) {
+            logError("Posting Reply", new Error("Token missing"), { questionUrl, opinionText });
+            return { status: "failed", message: "Token missing" };
+        }
+
+        // Prepare POST data
+        // --- FIX: Removed extra 'new' keyword ---
+        const formData = new URLSearchParams();
+        formData.append("forFeed", "True");
+        formData.append("__RequestVerificationToken", token);
+        formData.append("Comment", replyText);
+
+        try {
+            const response = await fetch(postUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": questionUrl,
+                    "Origin": window.location.origin
+                },
+                body: formData.toString(),
+                credentials: "same-origin"
+            });
+            const responseText = await response.text();
+            // Cloudflare/captcha check
+            if (
+                responseText.toLowerCase().includes("cloudflare") ||
+                responseText.toLowerCase().includes("cf-chl-widget") ||
+                responseText.toLowerCase().includes("attention required!") ||
+                responseText.toLowerCase().includes("captcha") ||
+                response.status === 403
+            ) {
+                console.warn("🛑 Cloudflare struck on POST, will try to resume in 5 seconds…");
+                logError("Cloudflare on POST", new Error("Cloudflare block"), { questionUrl, opinionText, status: response.status });
+                await delay(5000);
+                return await postReply({questionUrl, title, opinionId, opinionText, replyText, opinionOwnerUsername, askerUsername});
+            }
+
+            let json = null;
+            try { json = JSON.parse(responseText); } catch (e) {
+                // Not a JSON response, but we can still check its contents below.
+                logError("JSON Parse Error", e, { responseText, context: "postReply response" });
+            }
+
+            // Check for the specific block message first.
+            if (isBlockedResponse(responseText)) {
+                showBlockedAnimation(); // Show animation for being blocked
+                // Both are named, try to like the question to determine blocker
+                console.log(`Attempting to like question to determine blocker: ${questionUrl}`);
+                const likedSuccessfully = await tryLikeQuestion(questionUrl);
+                if (!likedSuccessfully) {
+                    // Liking failed, which means the ASKER blocked the user.
+                    logBlockedUser(askerUsername, "Asker", `Blocked by asker (liking failed): ${responseText.substring(0, 150)}`);
+                    return { status: "blocked", by: "asker" };
+                } else {
+                    // Liking succeeded, which means the OPINION OWNER must have blocked the user.
+                    logBlockedUser(opinionOwnerUsername, "Opinion Owner", `Blocked by opinion owner (liking succeeded): ${responseText.substring(0, 150)}`);
+                    return { status: "blocked", by: "opinion_owner" };
+                }
+            }
+
+            if (responseText.includes("Reply added!") || (json && json.message && json.message.text === "Reply added!")) {
+                logReply(questionUrl, title, opinionText, replyText, opinionOwnerUsername);
+                return { status: "success" };
+            }
+
+            if (responseText.toLowerCase().includes("you have already replied to this")) {
+                 return { status: "already_replied" };
+            }
+
+            // Fallback for non-JSON messages that might still be useful
+            if (json?.message?.text) {
+                const msg = json.message.text.toLowerCase();
+                if (msg.includes("you have already replied to this")) {
+                    return { status: "already_replied" };
+                }
+            }
+
+            console.error(`❌ Failed to post reply to: ${questionUrl} (HTTP ${response.status})`);
+            console.error("Server response:", responseText);
+            logError("Failed Post Reply", new Error("Server did not confirm reply"), { questionUrl, opinionText, responseStatus: response.status, responseText: responseText.substring(0, 200) });
+            return { status: "failed", responseText: responseText };
+
+        } catch (error) {
+            if (error && error.message && error.message.toLowerCase().includes("cloudflare")) {
+                console.warn("🛑 Cloudflare struck on POST, will try to resume in 5 seconds…");
+                logError("Cloudflare on POST (error)", error, { questionUrl, opinionText });
+                await delay(5000);
+                return await postReply({questionUrl, title, opinionId, opinionText, replyText, opinionOwnerUsername, askerUsername});
+            }
+            console.error(`❌ Network error posting reply to: ${questionUrl}`, error);
+            logError("Network Error Posting Reply", error, { questionUrl, opinionText });
+            return { status: "error", error: error };
+        }
+    }
+
+    // --- Main Loop ---
+
+    // Add buttons and control panel immediately on script load
+    addDownloadAndWipeButtons();
+    createControlPanel();
+    updateButtonCounts(); // Ensure counts are up-to-date on load
+
+    while (true) {
+        if (!scriptRunning) {
+            console.log("Script is paused. Waiting for resume...");
+            await delay(5000); // Check every 5 seconds if resumed
+            continue;
+        }
+
+        const opinions = await getLiveFeedOpinionsToReply();
+        if (!opinions.length) {
+            console.warn("⚠️ No new eligible opinions found to reply to. Waiting to reload.");
+            await delay(getRandomDelay(5000, 25000));
+            window.location.reload();
+            continue;
+        }
+
+        console.log(`🔗 Found ${opinions.length} eligible opinion(s) to process.`);
+        for (const op of opinions) {
+            // --- Like the opinion via POST before sending to LLM ---
+            try {
+                const likeBtn = op.card.querySelector('span.js-like-menu-option.ibar-like[data-href]');
+                if (likeBtn) {
+                    if (likeBtn.classList.contains('voted') || likeBtn.getAttribute('data-voted-agree') === 'true') {
+                        logSkippedOpinion(op.opinionId, "Skipped because opinion was already liked.");
+                        continue;
+                    } else {
+                        const likeUrl = likeBtn.getAttribute('data-href');
+                        let tokenInput = op.card.querySelector('input[name="__RequestVerificationToken"]');
+                        let token = tokenInput ? tokenInput.value : null;
+                        if (!token) {
+                            let match = document.cookie.match(/__RequestVerificationToken=([^;]+)/);
+                            token = match ? match[1] : null;
+                        }
+                        if (!token) {
+                            const html = await safeFetch(op.questionUrl);
+                            const parser = new DOMParser();
+                            const doc = parser.parseFromString(html, "text/html");
+                            let tokenInput = doc.querySelector('input[name="__RequestVerificationToken"]');
+                            token = tokenInput ? tokenInput.value : null;
+                        }
+
+                        if (likeUrl && token) {
+                            const formData = new URLSearchParams();
+                            formData.append('__RequestVerificationToken', token);
+                            const response = await fetch(likeUrl, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                    'Referer': window.location.href,
+                                    'Origin': window.location.origin
+                                },
+                                body: formData.toString(),
+                                credentials: 'same-origin'
+                            });
+                            const responseText = await response.text();
+
+                            if (isBlockedResponse(responseText)) {
+                                console.error(`⛔ Blocked by opinion owner (${op.opinionOwnerUsername}) during like attempt. Skipping.`);
+                                logBlockedUser(op.opinionOwnerUsername, "Opinion Owner", `Blocked on opinion like attempt`);
+                                logSkippedOpinion(op.opinionId, `Blocked by opinion owner on like`);
+                                showBlockedAnimation();
+                                continue;
+                            }
+
+                            try {
+                                const data = JSON.parse(responseText);
+                                if (data?.data?.Voted === true && data?.data?.VotedType === 'like') {
+                                    console.log('👍 Upvoted this opinion before processing.');
+                                } else {
+                                    logSkippedOpinion(op.opinionId, "Upvote failed, skipping opinion");
+                                    continue;
+                                }
+                            } catch (e) {
+                                logSkippedOpinion(op.opinionId, "Upvote response not JSON, skipping opinion");
+                                continue;
+                            }
+                        } else {
+                            logSkippedOpinion(op.opinionId, "Upvote button or token not found, skipping opinion");
+                            continue;
+                        }
+                    }
+                } else {
+                    logSkippedOpinion(op.opinionId, "Upvote button not found, skipping opinion");
+                    continue;
+                }
+            } catch (e) {
+                console.error('Error clicking upvote button, skipping opinion:', e);
+                logSkippedOpinion(op.opinionId, "Error clicking upvote button, skipping opinion");
+                continue;
+            }
+
+            if (!scriptRunning) break; // Allow pausing mid-loop
+
+            console.log(`\n➡️ Processing reply for opinion ${op.opinionId} by ${op.opinionOwnerGender} (${op.opinionOwnerUsername}) on: "${op.questionTitle}"`);
+            const fullPrompt = `you are replying specifically to the opinion posted by a ${op.opinionOwnerGender} tagged (@${slugifyUsername(op.opinionOwnerUsername)}), when the general topic is "${op.questionTitle}" and the specific opinion you are to reply to is this: "${op.opinionText}".
+- if you happen to tag their name, do so at the very beginning and only by using @`;
+            const repliesToSend = multiReplyEnabled ? getRandomDelay(2, 5) : 1;
+            console.log(`✉️ Will send ${repliesToSend} repl${repliesToSend > 1 ? 'ies' : 'y'}. Multi-reply is ${multiReplyEnabled ? 'ON' : 'OFF'}.`);
+            for (let i = 0; i < repliesToSend; i++) {
+                 if (!scriptRunning) break; // Allow pausing mid-burst
+
+                console.log(`--- Sending reply ${i + 1} of ${repliesToSend} ---`);
+                let replyText, attempts = 0, crazy = false;
+                const maxAttempts = 3;
+                let rejectedReason = "";
+                do {
+                    replyText = await getAnswerFromLLM(fullPrompt, crazy);
+                    attempts++;
+                    if (!isWeirdResponse(replyText)) break;
+                    rejectedReason = `Filtered/rejected: "${replyText}"`;
+                    console.warn(`⚠️ ${rejectedReason} (attempt ${attempts}${crazy ? ' crazy' : ''})`);
+                    if (attempts === maxAttempts && !crazy) {
+                        crazy = true;
+                        attempts = 0;
+                    }
+                } while (attempts < maxAttempts || crazy);
+                if (isWeirdResponse(replyText)) {
+                    console.warn(`⚠️ Giving up on replying to opinion "${op.opinionText.substring(0, 50)}..." on ${op.questionUrl} after ${crazy ? 'crazy ' : 'normal '}${attempts} attempts.`);
+                    if(i === 0) { // Only log rejection if it's the first (or only) attempt
+                       logRejectedOpinion(op.questionUrl, op.questionTitle, op.opinionText, rejectedReason || "LLM failed to generate suitable reply.");
+                    }
+                    continue; // Skip this specific reply attempt
+                }
+
+                const postResult = await postReply({
+                    questionUrl: op.questionUrl,
+                    title: op.questionTitle,
+                    opinionId: op.opinionId,
+                    opinionText: op.opinionText,
+                    replyText: replyText,
+                    opinionOwnerUsername: op.opinionOwnerUsername,
+                    askerUsername: op.askerUsername,
+                });
+                if (postResult.status === "success") {
+                    console.log(`✅ Replied to "${op.questionTitle}": "${replyText}"`);
+                    if(i < repliesToSend - 1) {
+                       const multiReplyWait = getRandomDelay(4000, 12000);
+                       console.log(`⏳ Waiting ${Math.round(multiReplyWait / 1000)}s for next reply in burst...`);
+                       await delay(multiReplyWait);
+                    }
+                } else if (postResult.status === "already_replied") {
+                    console.warn(`⚠️ Server reported already replied to this opinion for: ${op.questionUrl} — script log updated.`);
+                    logSkippedOpinion(op.opinionId, "Server reported already replied");
+                    break; // Stop trying to reply to this opinion
+                } else if (postResult.status === "blocked") {
+                    console.error(`⛔ Blocked from replying to: ${op.questionUrl} by ${postResult.by} — skipping.`);
+                    logSkippedOpinion(op.opinionId, `Server Blocked Reply by ${postResult.by}`);
+                    window.location.reload(); // Reload on block
+                    return;
+                } else {
+                    console.error(`❌ Failed to post reply to: ${op.questionUrl}`);
+                    if (i === 0) { // Only log rejection if it's the first (or only) attempt
+                        logRejectedOpinion(op.questionUrl, op.questionTitle, op.opinionText, postResult.responseText || "Unknown posting failure");
+                    }
+                    break; // Stop trying if a post fails
+                }
+            }
+
+            const waitMs = multiReplyEnabled ?
+                getRandomDelay(39000, 60000) : getRandomDelay(15000, 36000);
+            console.log(`⏳ Waiting ${Math.round(waitMs / 1000)} seconds before next opinion...`);
+            await delay(waitMs);
+        }
+
+        if (stopAtFirstProcessed) {
+            console.log("🟢 All eligible opinions processed (stop-at-first-processed mode). Reloading in 3 seconds...");
+            await delay(3000);
+            window.location.reload();
+            return;
+        }
+        console.log("🔄 All current opinions processed. Reloading live feed for new opinions...");
+        await delay(getRandomDelay(5000, 25000));
+        window.location.reload();
+    }
+})();
