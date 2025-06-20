@@ -1,0 +1,376 @@
+// ==UserScript==
+// @name        WangWang - With Gender Detection
+// @namespace   http://tampermonkey.net/
+// @version     6.0
+// @description ONLY CHANGE THE "ANSWER USING ONE SHORT SENTENCEE."
+// @author      Coomjar
+// @match       https://www.girlsaskguys.com/live-feed*
+// @grant       GM_xmlhttpRequest
+// ==/UserScript==
+
+(async function() {
+    'use strict';
+
+    // --------------------------------------------------------------------------------
+    // --- ⚙️ CONFIGURATION ----------------------------------------------------------
+    // --------------------------------------------------------------------------------
+    const CONFIG = {
+        // --- API Settings ---
+        WANGWANG_API_URL: "https://idea.wangwangit.com/api/generate",
+        WANGWANG_SERVER: "http://34.135.140.160:8081",
+        WANGWANG_MODEL: "brojo/deepthinkv1uncensored:latest",
+
+        // --- Structured Prompt Settings ---
+        // This part goes BEFORE the question. Use it for character descriptions or overall instructions.
+        PROMPT_PREAMBLE: `answer using one short sentence.`,
+
+        // The question prefix (e.g., "question asked by a man:") is now generated dynamically based on the asker's gender.
+
+        // This is the text that appears immediately after the question to signal the AI where to start writing.
+        PROMPT_SUFFIX: "Your answer:",
+
+        // This is added to your PROMPT_PREAMBLE instruction if the first AI response fails.
+        CRAZY_MODE_PROMPT_ADDITION: " be really crazy:",
+
+        // --- Script Behavior ---
+        POST_DELAY_MIN_MS: 20000,
+        POST_DELAY_MAX_MS: 30000,
+        RELOAD_DELAY_MIN_MS: 3000,
+        RELOAD_DELAY_MAX_MS: 6000,
+        LOCAL_STORAGE_KEY: 'gagSuperfanProcessedQuestions_WangWang',
+    };
+
+    let processedUrls = new Set();
+    // --------------------------------------------------------------------------------
+    // --- 📊 LOCAL STORAGE MANAGEMENT (Unchanged) ------------------------------------
+    // --------------------------------------------------------------------------------
+
+    function loadProcessedQuestions() {
+        try {
+            const stored = localStorage.getItem(CONFIG.LOCAL_STORAGE_KEY);
+            if (stored) {
+                processedUrls = new Set(JSON.parse(stored));
+                console.log(`✅ Loaded ${processedUrls.size} processed questions from local storage.`);
+            }
+        } catch (e) {
+            console.error("❌ Error loading processed questions from local storage:", e);
+        }
+    }
+
+    function saveProcessedQuestion(url) {
+        if (!processedUrls.has(url)) {
+            processedUrls.add(url);
+            try {
+                localStorage.setItem(CONFIG.LOCAL_STORAGE_KEY, JSON.stringify(Array.from(processedUrls)));
+                console.log(`💾 Saved question to local log: ${url}`);
+            } catch (e) {
+                console.error("❌ Error saving processed question to local storage:", e);
+            }
+        }
+    }
+
+    function clearProcessedQuestions() {
+        if (confirm("Are you sure you want to clear ALL processed questions from the log? This cannot be undone.")) {
+            localStorage.removeItem(CONFIG.LOCAL_STORAGE_KEY);
+            processedUrls.clear();
+            console.log("🗑️ Processed questions log cleared.");
+            alert("Processed questions log has been cleared!");
+        }
+    }
+
+    function downloadProcessedQuestions() {
+        if (processedUrls.size === 0) {
+            alert("No questions in the log to download!");
+            return;
+        }
+        const dataStr = JSON.stringify(Array.from(processedUrls), null, 2);
+        const blob = new Blob([dataStr], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `gag_superfan_log_${new Date().toISOString().slice(0, 10)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        console.log("⬇️ Processed questions log downloaded.");
+    }
+
+    // --------------------------------------------------------------------------------
+    // --- 🤖 API FUNCTION (MODIFIED with dynamic gender prefix) ---------------------
+    // --------------------------------------------------------------------------------
+
+    async function callWangWangAPI(questionText, gender, useCrazyMode = false) {
+        let finalPreamble = CONFIG.PROMPT_PREAMBLE;
+        if (useCrazyMode) {
+            finalPreamble += CONFIG.CRAZY_MODE_PROMPT_ADDITION;
+        }
+
+        // Determine the gender-specific term for the prompt.
+        let genderTerm = "person"; // Default term if gender is unknown
+        if (gender === 'male') {
+            genderTerm = "man";
+        } else if (gender === 'female') {
+            genderTerm = "woman";
+        }
+
+        // Construct the dynamic question prefix as requested.
+        const dynamicQuestionPrefix = `question asked by a ${genderTerm}:`;
+
+        // Assemble the full prompt using the new dynamic format
+        const fullPrompt = `${finalPreamble}\n\n${dynamicQuestionPrefix} ${questionText}\n\n${CONFIG.PROMPT_SUFFIX}`;
+
+        console.log("--- Sending Prompt to API ---\n" + fullPrompt + "\n-----------------------------");
+
+        const requestBody = {
+            server: CONFIG.WANGWANG_SERVER,
+            model: CONFIG.WANGWANG_MODEL,
+            prompt: fullPrompt
+        };
+
+        // We wrap GM_xmlhttpRequest in a Promise to use it with async/await
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: CONFIG.WANGWANG_API_URL,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Accept": "*/*",
+                },
+                data: JSON.stringify(requestBody),
+                responseType: 'text',
+                onload: function(response) {
+                    if (response.status >= 200 && response.status < 300) {
+                        let text = response.responseText;
+                        // Clean up newline characters as before
+                        text = text.replace(/\\n/g, ' ').replace(/\n/g, ' ');
+                        resolve({ success: true, text: text.trim() });
+                    } else {
+                        // Handle cases where the server returns an error
+                        resolve({ success: false, error: `API Error: ${response.status} - ${response.responseText.substring(0, 100)}` });
+                    }
+                },
+                onerror: function(error) {
+                    console.error("GM_xmlhttpRequest error:", error);
+                    resolve({ success: false, error: `Network error during API call.` });
+                },
+                ontimeout: function() {
+                    resolve({ success: false, error: "Request to WangWang API timed out." });
+                }
+            });
+        });
+    }
+
+
+    // --------------------------------------------------------------------------------
+    // --- 🌐 GIRLSASKGUYS HELPER FUNCTIONS (Gender detection already existed here) ---
+    // --------------------------------------------------------------------------------
+
+    function getQuestions() {
+        return Array.from(document.querySelectorAll('.js-live-feed-item.card-content'))
+            .map(card => card.querySelector('a.post-title'))
+            .filter(link => link && link.href)
+            .map(link => link.href)
+            .filter((href, index, self) => self.indexOf(href) === index);
+    }
+
+    async function getQuestionDetails(url) {
+        try {
+            const response = await fetch(url, { cache: "no-store" });
+            const html = await response.text();
+            const doc = new DOMParser().parseFromString(html, "text/html");
+            if (doc.querySelector(".opinion-shared-message") || doc.querySelector("#share-opinion-section textarea[disabled]")) {
+                return { status: 'already_answered' };
+            }
+
+            const token = doc.querySelector('input[name="__RequestVerificationToken"]')?.value;
+            if (!token) { return { status: 'no_token' }; }
+
+            const title = doc.querySelector('h1.title.js-title')?.textContent.trim() || "";
+            const details = doc.querySelector('.question-details-full .detail-body')?.textContent.trim() || "";
+            const fullText = `${title}\n${details}`.trim();
+            if (!fullText) { return { status: 'no_content' }; }
+
+            // This is the gender detection logic. It looks for 'guy' or 'girl' classes on the user's profile elements.
+            let gender = "unknown";
+            if (doc.querySelector('.post-user-profile.user-info.guy, .avatar-border.guy')) gender = "male";
+            if (doc.querySelector('.post-user-profile.user-info.girl, .avatar-border.girl')) gender = "female";
+            
+            return { status: 'ok', token, fullText, gender, title };
+
+        } catch (error) {
+            console.error(`❌ Fetch error for ${url}:`, error);
+            return { status: 'fetch_error' };
+        }
+    }
+
+    function isResponseWeird(text) {
+        if (!text || text.length < 15) return true;
+        if (text.includes('*')) return true;
+
+        const blockedWords = [
+            'ai', 'assistant', 'language model', 'comply', 'i am an ai', 'i am a bot',
+            'formal', 'i am not a person', 'toddlerish',
+            'i cannot', 'unable to', 'i am unable', "i'm not able", "i can't", 'joke',
+            'satire', 'grump', 'humorous', 'terms', 'uncomfortable', 'insults', 'helpful',
+            "i'm sorry", 'i am sorry', 'my apologies', 'i apologize', 'unfortunately',
+            'impossible', 'trolling', 'assist', 'i do not have', "i don't have", 'explicit', 'advice',
+            'disclaimer', 'character', "i can't", 'humor', 'hilarious', 'i cannot help with that', "roleplay",
+            "it's important to remember", 'respectful', 'asterisks', 'i must', 'it is crucial to',
+            'here is a', 'here are some', 'of course', 'original', 'asterisk'
+        ];
+        const lowerText = text.toLowerCase();
+        return blockedWords.some(phrase => {
+            const regex = new RegExp(`\\b${phrase.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&')}\\b`, 'i');
+            return regex.test(lowerText);
+        });
+    }
+
+    async function postOpinion(url, token, answer) {
+        const opinionURL = url + "/opinion";
+        const formBody = new URLSearchParams({
+            "__RequestVerificationToken": token,
+            "Answer": answer,
+            "IsAnonymous": "false",
+            "DisableComments": "false",
+        });
+        try {
+            const response = await fetch(opinionURL, {
+                method: "POST",
+                headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+                body: formBody,
+            });
+            const responseText = await response.text();
+
+            if (response.ok && responseText.includes("Opinion posted!")) {
+                console.log(`✅ Successfully posted opinion to: ${url}`);
+                return true;
+            }
+            if (responseText.includes("cannot post more than one opinion")) {
+                 console.warn(`⚠️ Already posted an opinion (server-side check): ${url}`);
+                return 'already_posted_server';
+            }
+            console.error("❌ Failed to post opinion. Server response:", responseText.substring(0, 500));
+            return false;
+
+        } catch (error) {
+            console.error("❌ Network error during opinion post.", error);
+            return false;
+        }
+    }
+
+    // --------------------------------------------------------------------------------
+    // --- ⚙️ UI FOR LOCAL STORAGE MANAGEMENT (Unchanged) -----------------------------
+    // --------------------------------------------------------------------------------
+    function createFloatingButton() {
+        const container = document.createElement('div');
+        Object.assign(container.style, {
+            position: 'fixed', bottom: '20px', right: '20px', zIndex: '10000',
+            backgroundColor: '#222', border: '1px solid #444', borderRadius: '5px',
+            padding: '10px', display: 'flex', flexDirection: 'column', gap: '5px',
+            fontFamily: 'Arial, sans-serif', fontSize: '12px', color: '#eee'
+        });
+        const title = document.createElement('div');
+        title.textContent = 'GAG Superfan Log';
+        title.style.fontWeight = 'bold';
+        container.appendChild(title);
+        const createButton = (text, onClick) => {
+            const button = document.createElement('button');
+            button.textContent = text;
+            Object.assign(button.style, {
+                backgroundColor: '#007bff', color: 'white', border: 'none',
+                padding: '8px 12px', borderRadius: '4px', cursor: 'pointer',
+                fontSize: '11px', transition: 'background 0.2s'
+            });
+            button.onmouseenter = () => button.style.backgroundColor = '#0056b3';
+            button.onmouseleave = () => button.style.backgroundColor = '#007bff';
+            button.onclick = onClick;
+            return button;
+        };
+        container.appendChild(createButton('Download Log', downloadProcessedQuestions));
+        container.appendChild(createButton('Clear Log', clearProcessedQuestions));
+        document.body.appendChild(container);
+    }
+
+    // --------------------------------------------------------------------------------
+    // --- 🚀 MAIN LOOP (MODIFIED to pass gender to API call) ------------------------
+    // --------------------------------------------------------------------------------
+
+    async function mainLoop() {
+        console.log("🚀 Starting main loop...");
+        const questions = getQuestions();
+        console.log(`🔎 Found ${questions.length} questions on the page.`);
+        for (const url of questions) {
+            if (processedUrls.has(url)) {
+                console.log(`[SKIP] Already in local log: ${url}`);
+                continue;
+            }
+
+            console.log(`[PROCESS] New question found: ${url}`);
+            const details = await getQuestionDetails(url);
+
+            if (details.status === 'already_answered') {
+                console.warn(`[SKIP] Question page indicates already answered: ${url}`);
+                saveProcessedQuestion(url);
+                continue;
+            }
+
+             if (details.status !== 'ok') {
+                console.error(`[SKIP] Cannot process question. Status: ${details.status}. URL: ${url}`);
+                if (details.status === 'no_token' || details.status === 'no_content') {
+                    saveProcessedQuestion(url);
+                }
+                continue;
+            }
+
+            console.log(`[AI-CALL] Sending to WangWang API: "${details.title}" (Asker: ${details.gender})`);
+            // Pass the detected gender to the API call function.
+            let answerObj = await callWangWangAPI(details.fullText, details.gender, false);
+
+            if (!answerObj.success || isResponseWeird(answerObj.text)) {
+                console.warn(`[RETRY] Initial response was weird or failed. Trying CRAZY MODE. Reason: ${answerObj.error || 'weirdness filter'}`);
+                // Also pass the gender on the retry attempt.
+                answerObj = await callWangWangAPI(details.fullText, details.gender, true);
+
+                if (!answerObj.success || isResponseWeird(answerObj.text)) {
+                    console.error(`[FAIL] CRAZY MODE also failed or produced weird response. Skipping question. Reason: ${answerObj.error || 'weirdness filter'}`);
+                    saveProcessedQuestion(url);
+                    continue;
+                }
+            }
+
+            console.log(`[POST] Posting opinion for: ${url}`);
+            const postResult = await postOpinion(url, details.token, answerObj.text);
+
+            if (postResult === true || postResult === 'already_posted_server') {
+                saveProcessedQuestion(url);
+            }
+
+            const delay = CONFIG.POST_DELAY_MIN_MS + Math.random() * (CONFIG.POST_DELAY_MAX_MS - CONFIG.POST_DELAY_MIN_MS);
+            console.log(`[WAIT] Pausing for ${Math.round(delay/1000)}s before next question...`);
+            await new Promise(res => setTimeout(res, delay));
+        }
+
+        const reloadDelay = CONFIG.RELOAD_DELAY_MIN_MS + Math.random() * (CONFIG.RELOAD_DELAY_MAX_MS - CONFIG.RELOAD_DELAY_MIN_MS);
+        console.log(`🏁 Main loop finished. Reloading page in ${Math.round(reloadDelay/1000)}s...`);
+        setTimeout(() => window.location.reload(), reloadDelay);
+    }
+
+    // --- SCRIPT START ---
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+            loadProcessedQuestions();
+            createFloatingButton();
+            if (window.location.href.includes("live-feed")) {
+                 mainLoop();
+            }
+        });
+    } else {
+        loadProcessedQuestions();
+        createFloatingButton();
+        if (window.location.href.includes("live-feed")) {
+            mainLoop();
+        }
+    }
+
+})();
